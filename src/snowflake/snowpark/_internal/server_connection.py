@@ -334,6 +334,7 @@ class ServerConnection:
         log_on_exception: bool = False,
         case_sensitive: bool = True,
         params: Optional[Sequence[Any]] = None,
+        num_statements: Optional[int] = None,
         **kwargs,
     ) -> Union[Dict[str, Any], AsyncJob]:
         try:
@@ -350,7 +351,7 @@ class ServerConnection:
                 logger.debug(f"Execute query [queryID: {results_cursor.sfqid}] {query}")
             else:
                 results_cursor = self._cursor.execute_async(
-                    query, params=params, **kwargs
+                    query, params=params, num_statements=num_statements, **kwargs
                 )
                 self.notify_query_listeners(
                     QueryRecord(results_cursor["queryId"], query)
@@ -382,6 +383,7 @@ class ServerConnection:
                 async_job_plan.post_actions,
                 log_on_exception,
                 case_sensitive=case_sensitive,
+                num_statements=num_statements,
                 **kwargs,
             )
 
@@ -390,7 +392,11 @@ class ServerConnection:
         results_cursor: SnowflakeCursor,
         to_pandas: bool = False,
         to_iter: bool = False,
+        num_statements: Optional[int] = None,
     ) -> Dict[str, Any]:
+        for _ in range((num_statements or 1) - 1):
+            results_cursor.nextset()
+
         if to_pandas:
             try:
                 data_or_iter = (
@@ -499,29 +505,12 @@ class ServerConnection:
                     break
             # since batch insert does not support async execution (? in the query), we handle it separately here
             if len(plan.queries) > 1 and not block and not is_batch_insert:
-                final_query = f"""EXECUTE IMMEDIATE $$
-DECLARE
-    res resultset;
-BEGIN
-    {";".join(q.sql for q in plan.queries[:-1])};
-    res := ({plan.queries[-1].sql});
-    return table(res);
-END;
-$$"""
-                # In multiple queries scenario, we are unable to get the query id of former query, so we replace
-                # place holder with fucntion last_query_id() here
+                params = []
                 for q in plan.queries:
-                    final_query = final_query.replace(
-                        f"'{q.query_id_place_holder}'", "LAST_QUERY_ID()"
-                    )
-                    if q.params:
-                        # TODO(SNOW-791242): Support this use case after migrating to use multi-statement from connector
-                        raise NotImplementedError(
-                            "Async multi-query dataframe using bind variable is not supported yet"
-                        )
+                    params.extend(q.params)
 
                 result = self.run_query(
-                    final_query,
+                    ";".join(q.sql for q in plan.queries),
                     to_pandas,
                     to_iter,
                     is_ddl_on_temp_object=plan.queries[0].is_ddl_on_temp_object,
@@ -530,6 +519,8 @@ $$"""
                     async_job_plan=plan,
                     log_on_exception=log_on_exception,
                     case_sensitive=case_sensitive,
+                    num_statements=len(plan.queries),
+                    params=params,
                     **kwargs,
                 )
 
